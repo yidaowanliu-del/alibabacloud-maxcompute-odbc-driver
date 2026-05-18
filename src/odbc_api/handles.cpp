@@ -311,24 +311,31 @@ SQLRETURN StmtHandle::fetch() {
       m_parent_conn ? m_parent_conn->getConfigForUpdate().clientCharset
                     : std::string("UTF-8");
 
-  // 遍历所有列，对已绑定的列进行数据转换
+  // 遍历所有列，对已绑定的列进行数据转换. 任何一列发生右截断时累计 WITH_INFO,
+  // 整行结束后一次性返回 SQL_SUCCESS_WITH_INFO + 01004; ERROR 则立即中止.
+  bool row_truncated = false;
   for (size_t i = 0; i < m_current_row->values.size(); ++i) {
     const auto &binding = m_bindings[i];
     if (binding.target_buffer == nullptr) {
-      continue;  // 该列未绑定，跳过
+      continue;
     }
 
     const auto &column_data = m_current_row->values[i];
     SQLRETURN conv_ret = convertAndWrite(column_data, binding, client_charset);
-    if (conv_ret != SQL_SUCCESS) {
-      // 在 convertAndWrite 中应添加诊断记录
+    if (conv_ret == SQL_ERROR) {
       return SQL_ERROR;
+    }
+    if (conv_ret == SQL_SUCCESS_WITH_INFO) {
+      row_truncated = true;
     }
   }
 
-  // 增加已获取行数计数
   m_fetched_rows++;
 
+  if (row_truncated) {
+    addDiagRecord({0, "01004", "String data, right-truncated"});
+    return SQL_SUCCESS_WITH_INFO;
+  }
   return SQL_SUCCESS;
 }
 
@@ -749,10 +756,13 @@ SQLRETURN StmtHandle::getData(SQLUSMALLINT col_num, SQLSMALLINT target_type,
       m_parent_conn ? m_parent_conn->getConfigForUpdate().clientCharset
                     : std::string("UTF-8");
   SQLRETURN conv_ret = convertAndWrite(column_data, binding, client_charset);
-  if (conv_ret != SQL_SUCCESS) {
+  if (conv_ret == SQL_ERROR) {
     return SQL_ERROR;
   }
-
+  if (conv_ret == SQL_SUCCESS_WITH_INFO) {
+    addDiagRecord({0, "01004", "String data, right-truncated"});
+    return SQL_SUCCESS_WITH_INFO;
+  }
   return SQL_SUCCESS;
 }
 

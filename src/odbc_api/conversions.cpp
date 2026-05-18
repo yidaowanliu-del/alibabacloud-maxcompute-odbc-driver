@@ -628,71 +628,36 @@ SQLRETURN convertAndWrite(const ColumnData &data,
               str_val = "<unsupported_type>";
             }
 
-            // Convert UTF-8 string to UTF-16 (SQLWCHAR)
-            // Buffer length is in bytes, calculate max UTF-16 chars
-            size_t max_chars =
-                static_cast<size_t>(binding.buffer_length) / sizeof(SQLWCHAR) -
-                1;  // Leave space for null terminator
-
-            // UTF-8 to UTF-16 conversion
-            size_t out_pos = 0;
-            uint16_t *dest =
-                reinterpret_cast<uint16_t *>(binding.target_buffer);
-            const char *src = str_val.c_str();
-            size_t src_len = str_val.length();
-
-            for (size_t i = 0; i < src_len && out_pos < max_chars; ++i) {
-              unsigned char c = static_cast<unsigned char>(src[i]);
-              uint32_t codepoint;
-
-              if (c < 0x80) {
-                codepoint = c;
-              } else if ((c & 0xE0) == 0xC0) {
-                if (i + 1 >= src_len) break;
-                codepoint = ((c & 0x1F) << 6) |
-                            (static_cast<unsigned char>(src[i + 1]) & 0x3F);
-                i += 1;
-              } else if ((c & 0xF0) == 0xE0) {
-                if (i + 2 >= src_len) break;
-                codepoint =
-                    ((c & 0x0F) << 12) |
-                    ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 6) |
-                    (static_cast<unsigned char>(src[i + 2]) & 0x3F);
-                i += 2;
-              } else if ((c & 0xF8) == 0xF0) {
-                if (i + 3 >= src_len || out_pos + 1 >= max_chars) break;
-                codepoint =
-                    ((c & 0x07) << 18) |
-                    ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 12) |
-                    ((static_cast<unsigned char>(src[i + 2]) & 0x3F) << 6) |
-                    (static_cast<unsigned char>(src[i + 3]) & 0x3F);
-                i += 3;
-                // Encode as surrogate pair
-                codepoint -= 0x10000;
-                dest[out_pos++] =
-                    static_cast<uint16_t>(0xD800 | (codepoint >> 10));
-                dest[out_pos++] =
-                    static_cast<uint16_t>(0xDC00 | (codepoint & 0x3FF));
-                continue;
-              } else {
-                continue;
-              }
-              dest[out_pos++] = static_cast<uint16_t>(codepoint);
-            }
-
-            // Null terminate
-            dest[out_pos] = 0;
+            // UTF-8 -> UTF-16 (or UTF-32 on iODBC) via shared helper. The
+            // helper handles surrogate-pair encoding, code-point boundary
+            // truncation, NUL-termination, and null/zero-size sizing mode.
+            // Returns total bytes the full output requires (excl. NUL), which
+            // is what StrLen_or_Ind must report for SQL_C_WCHAR per ODBC spec.
+            SQLWCHAR *out_buf = static_cast<SQLWCHAR *>(binding.target_buffer);
+            size_t out_size_bytes =
+                binding.buffer_length > 0
+                    ? static_cast<size_t>(binding.buffer_length)
+                    : 0;
+            size_t total_bytes =
+                encoding::WriteUtf8AsUtf16(str_val, out_buf, out_size_bytes);
 
             if (binding.indicator_ptr) {
-              *binding.indicator_ptr =
-                  static_cast<SQLLEN>(out_pos * sizeof(SQLWCHAR));
+              *binding.indicator_ptr = static_cast<SQLLEN>(total_bytes);
             }
 
-            MCO_LOG_DEBUG("SQL_C_WCHAR: converted {} bytes to {} UTF-16 chars",
-                          str_val.length(), out_pos);
-            // Always return SQL_SUCCESS since we successfully converted the
-            // data
-            return SQL_SUCCESS;
+            // Truncation: not enough room for full payload + NUL. When the
+            // buffer is too small to even hold a NUL (< sizeof(SQLWCHAR)),
+            // any non-empty payload is truncated.
+            bool truncated =
+                out_size_bytes < sizeof(SQLWCHAR)
+                    ? total_bytes > 0
+                    : total_bytes > out_size_bytes - sizeof(SQLWCHAR);
+
+            MCO_LOG_DEBUG(
+                "SQL_C_WCHAR: converted {} UTF-8 bytes -> {} bytes "
+                "(buffer_size={}, truncated={})",
+                str_val.length(), total_bytes, out_size_bytes, truncated);
+            return truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
           }
 
           default:

@@ -233,6 +233,115 @@ size_t WriteUtf8AsCharsetIconv(const std::string &utf8,
 
 }  // namespace
 
+namespace {
+
+// Decode one UTF-8 code point starting at `s[i]`. On success, sets
+// `*codepoint` and `*advance` (the number of source bytes consumed) and
+// returns true. On malformed input or truncated trailing bytes, returns false
+// (caller should bail out — the rest of the string can't be trusted).
+bool DecodeOneUtf8(const std::string &s, size_t i, uint32_t *codepoint,
+                   size_t *advance) {
+  unsigned char c = static_cast<unsigned char>(s[i]);
+  if (c < 0x80) {
+    *codepoint = c;
+    *advance = 1;
+    return true;
+  }
+  if ((c & 0xE0) == 0xC0) {
+    if (i + 1 >= s.size()) return false;
+    *codepoint =
+        ((c & 0x1F) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3F);
+    *advance = 2;
+    return true;
+  }
+  if ((c & 0xF0) == 0xE0) {
+    if (i + 2 >= s.size()) return false;
+    *codepoint = ((c & 0x0F) << 12) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(s[i + 2]) & 0x3F);
+    *advance = 3;
+    return true;
+  }
+  if ((c & 0xF8) == 0xF0) {
+    if (i + 3 >= s.size()) return false;
+    *codepoint = ((c & 0x07) << 18) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 12) |
+                 ((static_cast<unsigned char>(s[i + 2]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(s[i + 3]) & 0x3F);
+    *advance = 4;
+    return true;
+  }
+  return false;
+}
+
+// How many SQLWCHAR units a code point occupies on this host.
+size_t WideUnitsFor(uint32_t codepoint) {
+  if constexpr (sizeof(SQLWCHAR) == 2) {
+    return codepoint > 0xFFFF ? 2u : 1u;
+  } else {
+    return 1u;
+  }
+}
+
+// Write `codepoint` into `dest` (assumed to have room for WideUnitsFor(cp)
+// SQLWCHARs).
+void WriteCodePoint(SQLWCHAR *dest, uint32_t codepoint) {
+  if constexpr (sizeof(SQLWCHAR) == 2) {
+    if (codepoint > 0xFFFF) {
+      uint32_t v = codepoint - 0x10000;
+      dest[0] = static_cast<SQLWCHAR>(0xD800u | (v >> 10));
+      dest[1] = static_cast<SQLWCHAR>(0xDC00u | (v & 0x3FFu));
+    } else {
+      dest[0] = static_cast<SQLWCHAR>(codepoint);
+    }
+  } else {
+    dest[0] = static_cast<SQLWCHAR>(codepoint);
+  }
+}
+
+}  // namespace
+
+size_t WriteUtf8AsUtf16(const std::string &utf8, SQLWCHAR *buffer,
+                        size_t buffer_size_bytes) {
+  // Capacity in SQLWCHAR units, reserving one for the NUL when we're going
+  // to write to the buffer at all.
+  bool can_write =
+      (buffer != nullptr) && (buffer_size_bytes >= sizeof(SQLWCHAR));
+  size_t out_capacity_units =
+      can_write ? (buffer_size_bytes / sizeof(SQLWCHAR)) - 1u : 0u;
+
+  size_t out_pos = 0;      // SQLWCHAR units written into the buffer
+  size_t total_units = 0;  // SQLWCHAR units the full output requires
+  bool stopped_writing = false;
+
+  for (size_t i = 0; i < utf8.size();) {
+    uint32_t cp;
+    size_t adv;
+    if (!DecodeOneUtf8(utf8, i, &cp, &adv)) {
+      // Malformed / truncated tail: stop counting; we'd otherwise lie about
+      // how much output we'd produce.
+      break;
+    }
+    size_t units = WideUnitsFor(cp);
+    total_units += units;
+    if (!stopped_writing && can_write) {
+      if (out_pos + units > out_capacity_units) {
+        stopped_writing = true;  // not enough room without splitting code point
+      } else {
+        WriteCodePoint(buffer + out_pos, cp);
+        out_pos += units;
+      }
+    }
+    i += adv;
+  }
+
+  if (can_write) {
+    buffer[out_pos] = 0;  // NUL-terminate at character boundary
+  }
+
+  return total_units * sizeof(SQLWCHAR);
+}
+
 size_t WriteUtf8AsCharset(const std::string &utf8, const std::string &charset,
                           char *buffer, size_t buffer_size) {
   if (isUtf8Charset(charset)) {
