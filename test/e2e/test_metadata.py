@@ -5,6 +5,8 @@
 import sys
 import os
 
+import pyodbc
+
 # 添加父目录到路径以便导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,17 +37,25 @@ class TestMetadata(BaseTest):
         """测试 SQLColumns - 获取列信息"""
         conn = self.connect()
         cursor = conn.cursor()
-        
+
         # 获取 information_schema.tables 的列信息
         cursor.columns(table='information_schema.tables')
         columns = cursor.fetchall()
-        
+
         self.assert_greater(len(columns), 0, "Should return at least one column")
-        
-        # 检查列信息结构
+
+        # 检查列信息结构, 收集列名 -> DATA_TYPE 映射 (col[3]=COLUMN_NAME, col[4]=DATA_TYPE)
+        col_types = {}
         for col in columns:
             self.assert_not_none(col[3], "Column name should not be None")
-        
+            col_types[col[3].lower()] = col[4]
+
+        # information_schema.tables.table_name 是 STRING 列, 现在应当上报为 SQL_WVARCHAR (-9)
+        # 而不是过去的 SQL_VARCHAR (12). 这是 Power BI 中文显示修复的核心断言.
+        if 'table_name' in col_types:
+            self.assert_equals(col_types['table_name'], pyodbc.SQL_WVARCHAR,
+                               "STRING column 'table_name' must report DATA_TYPE=SQL_WVARCHAR")
+
         conn.close()
     
     def test_sqldescribecol(self):
@@ -61,14 +71,20 @@ class TestMetadata(BaseTest):
         self.assert_not_none(desc, "Cursor description should not be None")
         self.assert_equals(len(desc), 3, "Should have 3 columns")
 
-        # Check first column (num)
+        # 列名非空
         self.assert_not_none(desc[0][0], "Column 1 name should not be None")
-
-        # Check second column (str)
         self.assert_not_none(desc[1][0], "Column 2 name should not be None")
-
-        # Check third column (pi)
         self.assert_not_none(desc[2][0], "Column 3 name should not be None")
+
+        # 关键: STRING 字面量列 'test' 上报为 SQL_WVARCHAR, 让 Power BI / Wide-API
+        # 消费者通过 SQL_C_WCHAR 直接拿 UTF-16, 避免 zh-CN Windows 上的 GBK 误解码.
+        self.assert_equals(desc[1][1], pyodbc.SQL_WVARCHAR,
+                           "STRING literal column should report SQL_WVARCHAR")
+        # 整数 / 浮点列保留旧映射
+        self.assert_equals(desc[0][1], pyodbc.SQL_BIGINT,
+                           "Integer literal column should report SQL_BIGINT")
+        self.assert_equals(desc[2][1], pyodbc.SQL_DOUBLE,
+                           "Float literal column should report SQL_DOUBLE")
 
         conn.close()
     
@@ -77,21 +93,24 @@ class TestMetadata(BaseTest):
         conn = self.connect()
         cursor = conn.cursor()
 
-        cursor.execute("SELECT 1 as test_col")
+        # 同时验证 STRING / 整数两条映射, 因为 Power BI 走的是 SQLColAttribute 探测.
+        cursor.execute("SELECT 1 as test_col, 'hello' as text_col")
 
         # pyodbc does not have getcolattr method
         # Use cursor.description to get column attributes
         desc = cursor.description
         self.assert_not_none(desc, "Cursor description should not be None")
-        self.assert_equals(len(desc), 1, "Should have 1 column")
+        self.assert_equals(len(desc), 2, "Should have 2 columns")
 
         # Column name is at index 0
-        col_name = desc[0][0]
-        self.assert_not_none(col_name, "Column name should not be None")
+        self.assert_not_none(desc[0][0], "Column name should not be None")
+        self.assert_not_none(desc[1][0], "Column name should not be None")
 
         # Column type code is at index 1
-        col_type = desc[0][1]
-        self.assert_not_none(col_type, "Column type should not be None")
+        self.assert_equals(desc[0][1], pyodbc.SQL_BIGINT,
+                           "Integer literal should report SQL_BIGINT")
+        self.assert_equals(desc[1][1], pyodbc.SQL_WVARCHAR,
+                           "STRING literal should report SQL_WVARCHAR")
 
         conn.close()
     

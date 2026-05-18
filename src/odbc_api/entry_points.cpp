@@ -629,6 +629,23 @@ SQLRETURN GetInfoImpl(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
         info_length = sizeof(SQLUSMALLINT);
         break;
       }
+      // 字符类型相互转换的能力位. MaxCompute 通过 CAST AS STRING 支持文本/宽
+      // 文本之间的转换; 这是 Power BI / Power Query 在选择 SQL_C_WCHAR
+      // 路径前会探测的能力位 (default 分支返回 0 表示"不支持任何转换"对宽文
+      // 本驱动会让某些客户端走兼容性回退路径).
+      case SQL_CONVERT_CHAR:
+      case SQL_CONVERT_VARCHAR:
+      case SQL_CONVERT_LONGVARCHAR:
+      case SQL_CONVERT_WCHAR:
+      case SQL_CONVERT_WVARCHAR:
+      case SQL_CONVERT_WLONGVARCHAR: {
+        if (InfoValuePtr) {
+          *(SQLUINTEGER *)InfoValuePtr =
+              SQL_CVT_CHAR | SQL_CVT_VARCHAR | SQL_CVT_WCHAR | SQL_CVT_WVARCHAR;
+        }
+        info_length = sizeof(SQLUINTEGER);
+        break;
+      }
       case SQL_IDENTIFIER_CASE: {
         // 标识符大小写敏感性
         if (InfoValuePtr) {

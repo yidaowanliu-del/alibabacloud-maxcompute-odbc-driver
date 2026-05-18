@@ -564,97 +564,94 @@ SQLRETURN StmtHandle::getColAttribute(SQLUSMALLINT column_number,
       }
       return SQL_SUCCESS;
 
-    case SQL_DESC_TYPE_NAME:
-      // 返回数据类型的名称
+    case SQL_DESC_TYPE_NAME: {
+      // ODBC 类型名 (与 col->sql_type 对齐), 不是 MaxCompute 的原始类型名.
+      std::string type_name;
+      switch (col->sql_type) {
+        case SQL_CHAR:
+          type_name = "CHAR";
+          break;
+        case SQL_VARCHAR:
+          type_name = "VARCHAR";
+          break;
+        case SQL_LONGVARCHAR:
+          type_name = "LONGVARCHAR";
+          break;
+        case SQL_WCHAR:
+          type_name = "WCHAR";
+          break;
+        case SQL_WVARCHAR:
+          type_name = "WVARCHAR";
+          break;
+        case SQL_WLONGVARCHAR:
+          type_name = "WLONGVARCHAR";
+          break;
+        case SQL_DECIMAL:
+          type_name = "DECIMAL";
+          break;
+        case SQL_NUMERIC:
+          type_name = "NUMERIC";
+          break;
+        case SQL_SMALLINT:
+          type_name = "SMALLINT";
+          break;
+        case SQL_INTEGER:
+          type_name = "INTEGER";
+          break;
+        case SQL_REAL:
+          type_name = "REAL";
+          break;
+        case SQL_FLOAT:
+          type_name = "FLOAT";
+          break;
+        case SQL_DOUBLE:
+          type_name = "DOUBLE";
+          break;
+        case SQL_BIT:
+          type_name = "BIT";
+          break;
+        case SQL_TINYINT:
+          type_name = "TINYINT";
+          break;
+        case SQL_BIGINT:
+          type_name = "BIGINT";
+          break;
+        case SQL_BINARY:
+          type_name = "BINARY";
+          break;
+        case SQL_VARBINARY:
+          type_name = "VARBINARY";
+          break;
+        case SQL_LONGVARBINARY:
+          type_name = "LONGVARBINARY";
+          break;
+        case SQL_TYPE_DATE:
+          type_name = "DATE";
+          break;
+        case SQL_TYPE_TIME:
+          type_name = "TIME";
+          break;
+        case SQL_TYPE_TIMESTAMP:
+          type_name = "TIMESTAMP";
+          break;
+        case SQL_GUID:
+          type_name = "GUID";
+          break;
+        default:
+          type_name = "UNKNOWN";
+          break;
+      }
       if (character_attribute_ptr && buffer_length > 0) {
-        // Convert SQL type to string representation
-        std::string type_name;
-        switch (col->sql_type) {
-          case SQL_CHAR:
-            type_name = "CHAR";
-            break;
-          case SQL_VARCHAR:
-            type_name = "VARCHAR";
-            break;
-          case SQL_LONGVARCHAR:
-            type_name = "LONGVARCHAR";
-            break;
-          case SQL_WCHAR:
-            type_name = "WCHAR";
-            break;
-          case SQL_WVARCHAR:
-            type_name = "WVARCHAR";
-            break;
-          case SQL_WLONGVARCHAR:
-            type_name = "WLONGVARCHAR";
-            break;
-          case SQL_DECIMAL:
-            type_name = "DECIMAL";
-            break;
-          case SQL_NUMERIC:
-            type_name = "NUMERIC";
-            break;
-          case SQL_SMALLINT:
-            type_name = "SMALLINT";
-            break;
-          case SQL_INTEGER:
-            type_name = "INTEGER";
-            break;
-          case SQL_REAL:
-            type_name = "REAL";
-            break;
-          case SQL_FLOAT:
-            type_name = "FLOAT";
-            break;
-          case SQL_DOUBLE:
-            type_name = "DOUBLE";
-            break;
-          case SQL_BIT:
-            type_name = "BIT";
-            break;
-          case SQL_TINYINT:
-            type_name = "TINYINT";
-            break;
-          case SQL_BIGINT:
-            type_name = "BIGINT";
-            break;
-          case SQL_BINARY:
-            type_name = "BINARY";
-            break;
-          case SQL_VARBINARY:
-            type_name = "VARBINARY";
-            break;
-          case SQL_LONGVARBINARY:
-            type_name = "LONGVARBINARY";
-            break;
-          case SQL_TYPE_DATE:
-            type_name = "DATE";
-            break;
-          case SQL_TYPE_TIME:
-            type_name = "TIME";
-            break;
-          case SQL_TYPE_TIMESTAMP:
-            type_name = "TIMESTAMP";
-            break;
-          case SQL_GUID:
-            type_name = "GUID";
-            break;
-          default:
-            type_name = "UNKNOWN";
-            break;
-        }
         size_t len_to_copy = std::min(type_name.length(),
                                       static_cast<size_t>(buffer_length - 1));
         memcpy(character_attribute_ptr, type_name.c_str(), len_to_copy);
         reinterpret_cast<char *>(character_attribute_ptr)[len_to_copy] = '\0';
       }
       if (string_length_ptr) {
-        // Get the correct length for column type name by referring the relevant
-        // part from colSchema
-        *string_length_ptr =
-            static_cast<SQLSMALLINT>(col_schema.type_info->toString().length());
+        *string_length_ptr = static_cast<SQLSMALLINT>(type_name.length());
       }
       return SQL_SUCCESS;
+    }
 
     case SQL_DESC_OCTET_LENGTH:
       // 返回列的字节长度 - This refers to the max number of bytes required to

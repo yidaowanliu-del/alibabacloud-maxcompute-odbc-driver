@@ -62,6 +62,16 @@ if(GTest_FOUND)
     target_link_libraries(encoding_test PRIVATE common test_main ${ODBC_FRAMEWORKS})
     add_test(NAME encoding_test COMMAND encoding_test)
 
+    # convertColumn 类型映射测试: 直接编译 conversions.cpp + encoding.cpp,
+    # 同样为了避开 odbc_api SHARED 目标的导出表.
+    add_executable(convert_column_test
+        unit/convert_column_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/odbc_api/conversions.cpp
+        ${CMAKE_SOURCE_DIR}/src/odbc_api/encoding.cpp)
+    target_link_libraries(convert_column_test
+        PRIVATE maxcompute_client config common test_main ${ODBC_FRAMEWORKS})
+    add_test(NAME convert_column_test COMMAND convert_column_test)
+
     message(STATUS "Google Test found. Building all tests.")
 else()
     message(STATUS "Google Test not found. Skipping tests.")
