@@ -1,5 +1,6 @@
 #include "maxcompute_odbc/common/logging.h"
 #include "maxcompute_odbc/odbc_api/conversions.h"
+#include "maxcompute_odbc/odbc_api/encoding.h"
 #include "maxcompute_odbc/odbc_api/handles.h"
 #include <cstring>  // for memcpy
 
@@ -386,128 +387,15 @@ SQLRETURN StmtHandle::getColAttribute(SQLUSMALLINT column_number,
   switch (field_identifier) {
     case SQL_DESC_NAME:
     case SQL_COLUMN_NAME:
-      // 返回列名
-      if (character_attribute_ptr && buffer_length > 0) {
-        if (is_wide) {
-          // Wide character version - convert to UTF-16
-          SQLWCHAR *dest = static_cast<SQLWCHAR *>(character_attribute_ptr);
-          size_t max_chars =
-              static_cast<size_t>(buffer_length) / sizeof(SQLWCHAR) - 1;
-          size_t out_pos = 0;
-          const char *src = col_schema.name.c_str();
-          size_t src_len = col_schema.name.length();
-
-          for (size_t i = 0; i < src_len && out_pos < max_chars; ++i) {
-            unsigned char c = static_cast<unsigned char>(src[i]);
-            uint32_t codepoint;
-
-            if (c < 0x80) {
-              codepoint = c;
-            } else if ((c & 0xE0) == 0xC0) {
-              if (i + 1 >= src_len) break;
-              codepoint = ((c & 0x1F) << 6) |
-                          (static_cast<unsigned char>(src[i + 1]) & 0x3F);
-              i += 1;
-            } else if ((c & 0xF0) == 0xE0) {
-              if (i + 2 >= src_len) break;
-              codepoint =
-                  ((c & 0x0F) << 12) |
-                  ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 6) |
-                  (static_cast<unsigned char>(src[i + 2]) & 0x3F);
-              i += 2;
-            } else if ((c & 0xF8) == 0xF0) {
-              if (i + 3 >= src_len || out_pos + 1 >= max_chars) break;
-              codepoint =
-                  ((c & 0x07) << 18) |
-                  ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 12) |
-                  ((static_cast<unsigned char>(src[i + 2]) & 0x3F) << 6) |
-                  (static_cast<unsigned char>(src[i + 3]) & 0x3F);
-              i += 3;
-              codepoint -= 0x10000;
-              dest[out_pos++] =
-                  static_cast<SQLWCHAR>(0xD800 | (codepoint >> 10));
-              dest[out_pos++] =
-                  static_cast<SQLWCHAR>(0xDC00 | (codepoint & 0x3FF));
-              continue;
-            } else {
-              continue;
-            }
-            dest[out_pos++] = static_cast<SQLWCHAR>(codepoint);
-          }
-          dest[out_pos] = 0;
-          if (string_length_ptr) {
-            // 返回字符数，而不是字节数
-            *string_length_ptr = static_cast<SQLSMALLINT>(out_pos);
-          }
-        } else {
-          // Narrow character version
-          size_t len_to_copy = std::min(col_schema.name.length(),
-                                        static_cast<size_t>(buffer_length - 1));
-          memcpy(character_attribute_ptr, col_schema.name.c_str(), len_to_copy);
-          reinterpret_cast<char *>(character_attribute_ptr)[len_to_copy] = '\0';
-          if (string_length_ptr) {
-            *string_length_ptr =
-                static_cast<SQLSMALLINT>(col_schema.name.length());
-          }
-        }
-      } else if (string_length_ptr) {
-        *string_length_ptr = static_cast<SQLSMALLINT>(col_schema.name.length());
-      }
-      return SQL_SUCCESS;
-
     case SQL_DESC_LABEL:
-      // 返回列标签（通常和列名相同）
+      // 列名 / 列标签 — 三者都返回 col_schema.name.
       if (character_attribute_ptr && buffer_length > 0) {
         if (is_wide) {
-          // Wide character version - convert to UTF-16
-          SQLWCHAR *dest = static_cast<SQLWCHAR *>(character_attribute_ptr);
-          size_t max_chars =
-              static_cast<size_t>(buffer_length) / sizeof(SQLWCHAR) - 1;
-          size_t out_pos = 0;
-          const char *src = col_schema.name.c_str();
-          size_t src_len = col_schema.name.length();
-
-          for (size_t i = 0; i < src_len && out_pos < max_chars; ++i) {
-            unsigned char c = static_cast<unsigned char>(src[i]);
-            uint32_t codepoint;
-
-            if (c < 0x80) {
-              codepoint = c;
-            } else if ((c & 0xE0) == 0xC0) {
-              if (i + 1 >= src_len) break;
-              codepoint = ((c & 0x1F) << 6) |
-                          (static_cast<unsigned char>(src[i + 1]) & 0x3F);
-              i += 1;
-            } else if ((c & 0xF0) == 0xE0) {
-              if (i + 2 >= src_len) break;
-              codepoint =
-                  ((c & 0x0F) << 12) |
-                  ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 6) |
-                  (static_cast<unsigned char>(src[i + 2]) & 0x3F);
-              i += 2;
-            } else if ((c & 0xF8) == 0xF0) {
-              if (i + 3 >= src_len || out_pos + 1 >= max_chars) break;
-              codepoint =
-                  ((c & 0x07) << 18) |
-                  ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 12) |
-                  ((static_cast<unsigned char>(src[i + 2]) & 0x3F) << 6) |
-                  (static_cast<unsigned char>(src[i + 3]) & 0x3F);
-              i += 3;
-              codepoint -= 0x10000;
-              dest[out_pos++] =
-                  static_cast<SQLWCHAR>(0xD800 | (codepoint >> 10));
-              dest[out_pos++] =
-                  static_cast<SQLWCHAR>(0xDC00 | (codepoint & 0x3FF));
-              continue;
-            } else {
-              continue;
-            }
-            dest[out_pos++] = static_cast<SQLWCHAR>(codepoint);
-          }
-          dest[out_pos] = 0;
+          size_t total_bytes = encoding::WriteUtf8AsUtf16(
+              col_schema.name, static_cast<SQLWCHAR *>(character_attribute_ptr),
+              static_cast<size_t>(buffer_length));
           if (string_length_ptr) {
-            // 返回字符数，而不是字节数
-            *string_length_ptr = static_cast<SQLSMALLINT>(out_pos);
+            *string_length_ptr = static_cast<SQLSMALLINT>(total_bytes);
           }
         } else {
           // Narrow character version
@@ -521,7 +409,15 @@ SQLRETURN StmtHandle::getColAttribute(SQLUSMALLINT column_number,
           }
         }
       } else if (string_length_ptr) {
-        *string_length_ptr = static_cast<SQLSMALLINT>(col_schema.name.length());
+        // 仅询问长度: Wide 路径报 UTF-16/UTF-32 字节数, Narrow 路径报 UTF-8
+        // 字节数.
+        if (is_wide) {
+          *string_length_ptr = static_cast<SQLSMALLINT>(
+              encoding::WriteUtf8AsUtf16(col_schema.name, nullptr, 0));
+        } else {
+          *string_length_ptr =
+              static_cast<SQLSMALLINT>(col_schema.name.length());
+        }
       }
       return SQL_SUCCESS;
 

@@ -1,5 +1,6 @@
 #include "maxcompute_odbc/common/logging.h"
 #include "maxcompute_odbc/common/utils.h"
+#include "maxcompute_odbc/odbc_api/encoding.h"
 #include "maxcompute_odbc/odbc_api/entry_points.h"
 #include "maxcompute_odbc/odbc_api/handle_registry.h"
 #include "maxcompute_odbc/odbc_api/handles.h"
@@ -1427,57 +1428,21 @@ SQLRETURN SQL_API SQLDescribeColW(
     return ret;
   }
 
-  // Convert column name to UTF-16 if buffer is provided
+  // Convert column name to UTF-16 if buffer is provided.
+  // NameLengthPtr is in SQLWCHAR units (characters) per ODBC spec; we
+  // preserve the pre-existing convention of interpreting BufferLength as
+  // bytes here to match the prior implementation.
+  std::string col_name(temp_buf.data(), name_len);
   if (ColumnName && BufferLength > 0) {
-    std::string col_name(temp_buf.data(), name_len);
-    size_t max_chars = static_cast<size_t>(BufferLength) / sizeof(SQLWCHAR) - 1;
-    uint16_t *dest = reinterpret_cast<uint16_t *>(ColumnName);
-    size_t out_pos = 0;
-    const char *src = col_name.c_str();
-    size_t src_len = col_name.length();
-
-    for (size_t i = 0; i < src_len && out_pos < max_chars; ++i) {
-      unsigned char c = static_cast<unsigned char>(src[i]);
-      uint32_t codepoint;
-
-      if (c < 0x80) {
-        codepoint = c;
-      } else if ((c & 0xE0) == 0xC0) {
-        if (i + 1 >= src_len) break;
-        codepoint =
-            ((c & 0x1F) << 6) | (static_cast<unsigned char>(src[i + 1]) & 0x3F);
-        i += 1;
-      } else if ((c & 0xF0) == 0xE0) {
-        if (i + 2 >= src_len) break;
-        codepoint = ((c & 0x0F) << 12) |
-                    ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 6) |
-                    (static_cast<unsigned char>(src[i + 2]) & 0x3F);
-        i += 2;
-      } else if ((c & 0xF8) == 0xF0) {
-        if (i + 3 >= src_len || out_pos + 1 >= max_chars) break;
-        codepoint = ((c & 0x07) << 18) |
-                    ((static_cast<unsigned char>(src[i + 1]) & 0x3F) << 12) |
-                    ((static_cast<unsigned char>(src[i + 2]) & 0x3F) << 6) |
-                    (static_cast<unsigned char>(src[i + 3]) & 0x3F);
-        i += 3;
-        codepoint -= 0x10000;
-        dest[out_pos++] = static_cast<SQLWCHAR>(0xD800 | (codepoint >> 10));
-        dest[out_pos++] = static_cast<SQLWCHAR>(0xDC00 | (codepoint & 0x3FF));
-        continue;
-      } else {
-        continue;
-      }
-      dest[out_pos++] = static_cast<SQLWCHAR>(codepoint);
-    }
-    dest[out_pos] = 0;
-
+    size_t total_bytes = maxcompute_odbc::encoding::WriteUtf8AsUtf16(
+        col_name, ColumnName, static_cast<size_t>(BufferLength));
     if (NameLengthPtr) {
-      // 返回字符数，而不是字节数
-      *NameLengthPtr = static_cast<SQLSMALLINT>(out_pos);
+      *NameLengthPtr = static_cast<SQLSMALLINT>(total_bytes / sizeof(SQLWCHAR));
     }
   } else if (NameLengthPtr) {
-    // 返回字符数，而不是字节数
-    *NameLengthPtr = name_len;
+    size_t total_bytes =
+        maxcompute_odbc::encoding::WriteUtf8AsUtf16(col_name, nullptr, 0);
+    *NameLengthPtr = static_cast<SQLSMALLINT>(total_bytes / sizeof(SQLWCHAR));
   }
 
   return ret;
@@ -2512,54 +2477,29 @@ SQLRETURN SQL_API SQLGetDiagRecW(SQLSMALLINT HandleType, SQLHANDLE Handle,
       *NativeError = record.native_error_code;
     }
 
-    // Prepare message string if provided
-    if (MessageText) {
-      // Convert message to wide character string using proper UTF-8 to UTF-16
-      // conversion
-      //
-      // IMPORTANT: According to ODBC specification, SQLGetDiagRecW's
-      // BufferLength is in CHARACTERS, not bytes. But StdStringToOdbcWString
-      // uses bytes. We need to convert between them.
-      std::string message = record.message;
-      SQLSMALLINT actual_bytes = 0;
-
-      if (BufferLength > 0) {
-        // Convert character count to byte count for StdStringToOdbcWString
-        SQLSMALLINT buffer_bytes =
-            static_cast<SQLSMALLINT>(BufferLength * sizeof(SQLWCHAR));
-        StdStringToOdbcWString(message, MessageText, buffer_bytes,
-                               &actual_bytes);
-      } else {
-        // Calculate required length even with no buffer
-        StdStringToOdbcWString(message, nullptr, 0, &actual_bytes);
-      }
-
-      // Report the actual length in characters if requested
-      // (ODBC spec requires TextLengthPtr to return character count)
+    // Prepare message string if provided.
+    // ODBC spec: SQLGetDiagRecW's BufferLength and TextLengthPtr are in
+    // SQLWCHAR units (characters), not bytes. WriteUtf8AsUtf16 takes/returns
+    // bytes — convert with sizeof(SQLWCHAR).
+    const std::string &message = record.message;
+    if (MessageText && BufferLength > 0) {
+      size_t total_bytes = maxcompute_odbc::encoding::WriteUtf8AsUtf16(
+          message, MessageText,
+          static_cast<size_t>(BufferLength) * sizeof(SQLWCHAR));
+      SQLSMALLINT total_chars =
+          static_cast<SQLSMALLINT>(total_bytes / sizeof(SQLWCHAR));
       if (TextLengthPtr) {
-        *TextLengthPtr = actual_bytes / sizeof(SQLWCHAR);
+        *TextLengthPtr = total_chars;
       }
-
-      // If the message was truncated due to buffer size, return
-      // SQL_SUCCESS_WITH_INFO
-      if (BufferLength > 0) {
-        // Calculate required buffer size in bytes
-        SQLSMALLINT required_bytes = 0;
-        StdStringToOdbcWString(message, nullptr, 0, &required_bytes);
-        SQLSMALLINT required_chars = required_bytes / sizeof(SQLWCHAR);
-        if (required_chars > BufferLength) {
-          MCO_LOG_WARNING(
-              "SQLGetDiagRecW: Buffer too small for message, truncated");
-          return SQL_SUCCESS_WITH_INFO;
-        }
+      if (total_chars > BufferLength) {
+        MCO_LOG_WARNING(
+            "SQLGetDiagRecW: Buffer too small for message, truncated");
+        return SQL_SUCCESS_WITH_INFO;
       }
     } else if (TextLengthPtr) {
-      // If message buffer not provided but length is, report required length
-      // in characters
-      std::string message = record.message;
-      SQLSMALLINT required_bytes = 0;
-      StdStringToOdbcWString(message, nullptr, 0, &required_bytes);
-      *TextLengthPtr = required_bytes / sizeof(SQLWCHAR);
+      size_t total_bytes =
+          maxcompute_odbc::encoding::WriteUtf8AsUtf16(message, nullptr, 0);
+      *TextLengthPtr = static_cast<SQLSMALLINT>(total_bytes / sizeof(SQLWCHAR));
     }
 
     MCO_LOG_DEBUG("SQLGetDiagRecW successful, RecNumber: {}, SQLSTATE: {}",
