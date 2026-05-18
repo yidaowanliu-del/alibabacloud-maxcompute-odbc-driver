@@ -137,23 +137,63 @@ inline size_t Utf8ToUtf16(const std::string &input, uint16_t *output,
   return out_pos;
 }
 
-/// Convert ODBC narrow string (SQLCHAR*) to std::string
+/// Convert ODBC narrow string (SQLCHAR*) to std::string (UTF-8 internally).
+///
+/// On Windows, SQLCHAR* from ANSI ODBC entry points (SQLExecDirect,
+/// SQLPrepare, SQLDriverConnect, SQLConnect, etc.) is encoded in the
+/// system ANSI code page (CP_ACP — GBK/CP936 on zh-CN). Returning those
+/// bytes verbatim breaks downstream consumers that assume UTF-8 (pugixml
+/// XML bodies are declared UTF-8, the MaxCompute server parses as UTF-8).
+/// We round-trip CP_ACP → UTF-16 → UTF-8 so the rest of the driver can
+/// treat all strings uniformly as UTF-8.
+///
+/// On Unix the convention is that SQLCHAR* is already UTF-8, so we copy
+/// bytes verbatim.
 inline std::string OdbcStringToStdString(const SQLCHAR *odbc_str,
                                          SQLSMALLINT length) {
   if (odbc_str == nullptr) {
     return "";
   }
 
+  size_t byte_len;
   if (length == SQL_NTS) {
-    // SQL_NTS: use strlen to calculate length
-    return std::string(reinterpret_cast<const char *>(odbc_str));
+    byte_len = std::strlen(reinterpret_cast<const char *>(odbc_str));
   } else if (length < 0) {
-    // Other negative values are invalid, return empty string
     return "";
   } else {
-    // Explicit length given
-    return std::string(reinterpret_cast<const char *>(odbc_str), length);
+    byte_len = static_cast<size_t>(length);
   }
+
+  if (byte_len == 0) {
+    return "";
+  }
+
+#if defined(_WIN32) || defined(_WIN64)
+  const char *src = reinterpret_cast<const char *>(odbc_str);
+  const int src_len = static_cast<int>(byte_len);
+
+  int wide_len = MultiByteToWideChar(CP_ACP, 0, src, src_len, nullptr, 0);
+  if (wide_len <= 0) {
+    // Fallback: assume input is already UTF-8 (or pure ASCII).
+    return std::string(src, byte_len);
+  }
+
+  std::wstring wide(static_cast<size_t>(wide_len), L'\0');
+  MultiByteToWideChar(CP_ACP, 0, src, src_len, &wide[0], wide_len);
+
+  int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wide_len,
+                                     nullptr, 0, nullptr, nullptr);
+  if (utf8_len <= 0) {
+    return std::string(src, byte_len);
+  }
+
+  std::string utf8(static_cast<size_t>(utf8_len), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wide_len, &utf8[0], utf8_len,
+                      nullptr, nullptr);
+  return utf8;
+#else
+  return std::string(reinterpret_cast<const char *>(odbc_str), byte_len);
+#endif
 }
 
 /// Convert ODBC wide string (SQLWCHAR*) to std::string (UTF-8)
