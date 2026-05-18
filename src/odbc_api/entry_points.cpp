@@ -1240,6 +1240,23 @@ SQLRETURN SQL_API SQLConnect(SQLHDBC ConnectionHandle, SQLCHAR *ServerName,
                        OdbcStringToStdString(Authentication, NameLength3));
 }
 
+// SQLConnectW is the wide character version of SQLConnect.
+// IMPORTANT: Windows Driver Manager classifies a driver as Unicode only if
+// it exports SQLConnectW. Without this export the DM treats the driver as
+// ANSI and down-converts every SQL_C_WCHAR fetch to SQL_C_CHAR before
+// forwarding, which breaks the WVARCHAR write path entirely.
+SQLRETURN SQL_API SQLConnectW(SQLHDBC ConnectionHandle, SQLWCHAR *ServerName,
+                              SQLSMALLINT NameLength1, SQLWCHAR *UserName,
+                              SQLSMALLINT NameLength2, SQLWCHAR *Authentication,
+                              SQLSMALLINT NameLength3) {
+  auto *conn = maxcompute_odbc::HandleRegistry::instance()
+                   .get<maxcompute_odbc::ConnHandle>(ConnectionHandle);
+  if (!conn) return SQL_INVALID_HANDLE;
+  return conn->connect(OdbcWStringToStdString(ServerName, NameLength1),
+                       OdbcWStringToStdString(UserName, NameLength2),
+                       OdbcWStringToStdString(Authentication, NameLength3));
+}
+
 // SQLDisconnect is an old ODBC 2.x function for disconnecting from a data
 // source
 SQLRETURN SQL_API SQLDisconnect(SQLHDBC ConnectionHandle) {
