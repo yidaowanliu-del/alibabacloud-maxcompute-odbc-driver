@@ -295,42 +295,6 @@ class MaxComputeClientImpl {
                            "Query did not complete within 1h timeout.");
   }
 
-  Result<std::string> getSchemaJson(const ExecuteSQLRequest &request) {
-    ExecuteSQLRequest explain_request = request;
-    explain_request.query = "explain output " + request.query;
-
-    (*explain_request.options->hints)["odps.sql.select.output.format"] = "json";
-
-    MCO_LOG_DEBUG("Fetching schema via EXPLAIN CODE: {}",
-                  explain_request.query);
-
-    auto instance_result = submitQuery(explain_request);
-    if (!instance_result.has_value()) {
-      return makeError<std::string>(instance_result.error().code,
-                                    instance_result.error().message);
-    }
-
-    Instance instance = instance_result.value();
-    auto wait_result = waitForSuccess(instance);
-    if (!wait_result.has_value()) {
-      return makeError<std::string>(wait_result.error().code,
-                                    wait_result.error().message);
-    }
-
-    // Now fetch the result (which should be the JSON schema)
-    // 注意：getSchemaJson 用于 EXPLAIN 查询，通常不需要 MaxQA 支持
-    // 传递 nullptr 作为 maxQAInfo 参数
-    auto raw_result = getRawResult(instance.id, nullptr);
-    if (!raw_result.has_value()) {
-      return makeError<std::string>(raw_result.error().code,
-                                    raw_result.error().message);
-    }
-
-    std::string schema_json = raw_result.value();
-    MCO_LOG_DEBUG("Schema JSON received: {}", schema_json);
-    return makeSuccess(schema_json);
-  }
-
   Result<std::vector<std::string>> listSchemas() {
     std::string path;
     std::vector<std::string> res;
@@ -540,18 +504,22 @@ class MaxComputeClientImpl {
 // ===================================================================
 class ResultStreamImpl : public ResultStream {
  public:
-  ResultStreamImpl(internal::MaxComputeClientImpl &sdk_impl, Instance instance,
-                   std::shared_ptr<const ResultSetSchema> schema)
+  ResultStreamImpl(internal::MaxComputeClientImpl &sdk_impl, Instance instance)
       : m_sdk_impl(sdk_impl),
         m_instance(std::move(instance)),
-        m_query_id(m_instance.id),
-        m_schema(std::move(schema)) {
+        m_query_id(m_instance.id) {
     MCO_LOG_DEBUG("ResultStream created for QueryID: {}", m_query_id);
   }
 
   const std::string &getId() const override { return m_query_id; }
 
   Result<const ResultSetSchema *> getSchema() override {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto init_result = ensureSessionInitialized();
+    if (!init_result.has_value()) {
+      return makeError<const ResultSetSchema *>(init_result.error().code,
+                                                init_result.error().message);
+    }
     return makeSuccess(m_schema.get());
   }
 
@@ -566,21 +534,27 @@ class ResultStreamImpl : public ResultStream {
       return makeSuccess(std::optional<Record>(std::nullopt));
     }
 
-    // 首次调用时，需要等待查询完成并初始化数据流
-    if (!m_stream_initialized) {
-      auto wait_result = waitForQueryCompletion();
-      if (!wait_result.has_value()) {
-        m_end_of_stream = true;
-        return makeError<std::optional<Record>>(wait_result.error().code,
-                                                wait_result.error().message);
-      }
+    auto init_result = ensureSessionInitialized();
+    if (!init_result.has_value()) {
+      m_end_of_stream = true;
+      return makeError<std::optional<Record>>(init_result.error().code,
+                                              init_result.error().message);
+    }
 
-      auto init_result = initializeTunnel();
-      if (!init_result.has_value()) {
+    if (m_non_tabular) {
+      if (m_fallback_row_consumed) {
         m_end_of_stream = true;
-        return makeError<std::optional<Record>>(init_result.error().code,
-                                                init_result.error().message);
+        return makeSuccess(std::optional<Record>(std::nullopt));
       }
+      m_fallback_row_consumed = true;
+      return makeSuccess(std::optional<Record>(std::move(m_fallback_row)));
+    }
+
+    auto reader_result = ensureReaderInitialized();
+    if (!reader_result.has_value()) {
+      m_end_of_stream = true;
+      return makeError<std::optional<Record>>(reader_result.error().code,
+                                              reader_result.error().message);
     }
 
     if (!m_bufferedReader) {
@@ -625,15 +599,49 @@ class ResultStreamImpl : public ResultStream {
     return makeSuccess();
   }
 
-  Result<void> initializeTunnel() {
+  Result<void> ensureSessionInitialized() {
+    if (m_session_initialized) {
+      return makeSuccess();
+    }
+
+    auto wait_result = waitForQueryCompletion();
+    if (!wait_result.has_value()) {
+      return wait_result;
+    }
+
+    auto tunnel_result = initializeTunnelSession();
+    if (tunnel_result.has_value()) {
+      m_session_initialized = true;
+      return makeSuccess();
+    }
+
+    MCO_LOG_INFO("Falling back to raw result for QueryID {}: {}", m_query_id,
+                 tunnel_result.error().message);
+    auto raw_result = initializeRawFallback();
+    if (!raw_result.has_value()) {
+      return makeError<void>(tunnel_result.error().code,
+                             tunnel_result.error().message);
+    }
+
+    m_session_initialized = true;
+    return makeSuccess();
+  }
+
+  Result<void> initializeTunnelSession() {
     MCO_LOG_DEBUG("Initializing Tunnel download session for QueryID: {}",
                   m_query_id);
     auto startTime = std::chrono::steady_clock::now();
 
     try {
-      // 创建下载会话
       m_downloadSession = std::make_unique<DownloadSession>(
           m_sdk_impl.getConfig(), m_instance.id);
+      auto schema = m_downloadSession->GetSchema();
+      if (!schema) {
+        return makeError<void>(ErrorCode::ParseError,
+                               "Tunnel session returned no schema.");
+      }
+      m_schema = schema;
+      m_non_tabular = false;
 
       auto endTime = std::chrono::steady_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -644,22 +652,52 @@ class ResultStreamImpl : public ResultStream {
           "TotalRecordCount: {}, cost: {}ms",
           m_query_id, m_downloadSession->GetDownloadId(),
           m_downloadSession->GetRecordCount(), duration);
-
-      // 创建 BufferedRecordReader
-      m_bufferedReader = m_downloadSession->OpenConcurrentBufferedRecordReader(
-          m_sdk_impl.getConfig().fetchResultSplitSize,
-          m_sdk_impl.getConfig().fetchResultThreadNum,
-          m_sdk_impl.getConfig().fetchResultPreloadSplitNum);
-
-      m_stream_initialized = true;
       return makeSuccess();
     } catch (const std::exception &e) {
-      MCO_LOG_ERROR("Failed to initialize tunnel session:" +
-                    std::string(e.what()));
+      MCO_LOG_ERROR("Failed to initialize tunnel session:{}", e.what());
       return makeError<void>(
           ErrorCode::UnknownError,
           "Failed to initialize tunnel session: " + std::string(e.what()));
     }
+  }
+
+  Result<void> initializeRawFallback() {
+    const MaxQASessionInfo *maxQAInfo =
+        m_instance.maxQAInfo.isMaxQA ? &m_instance.maxQAInfo : nullptr;
+    auto raw_result = m_sdk_impl.getRawResult(m_instance.id, maxQAInfo);
+    if (!raw_result.has_value()) {
+      return makeError<void>(
+          raw_result.error().code,
+          "Failed to get raw result: " + raw_result.error().message);
+    }
+
+    std::vector<Column> columns;
+    columns.push_back(
+        Column::buildColumn("Result", PrimitiveTypeInfo(OdpsType::STRING)));
+    m_schema = std::make_shared<const ResultSetSchema>(
+        ResultSetSchema(std::move(columns)));
+    m_fallback_row = Record(Record::createValues(raw_result.value()));
+    m_non_tabular = true;
+    m_fallback_row_consumed = false;
+    return makeSuccess();
+  }
+
+  Result<void> ensureReaderInitialized() {
+    if (m_non_tabular || m_stream_initialized) {
+      return makeSuccess();
+    }
+
+    if (!m_downloadSession) {
+      return makeError<void>(ErrorCode::UnknownError,
+                             "Internal error: DownloadSession is null.");
+    }
+
+    m_bufferedReader = m_downloadSession->OpenConcurrentBufferedRecordReader(
+        m_sdk_impl.getConfig().fetchResultSplitSize,
+        m_sdk_impl.getConfig().fetchResultThreadNum,
+        m_sdk_impl.getConfig().fetchResultPreloadSplitNum);
+    m_stream_initialized = true;
+    return makeSuccess();
   }
 
   internal::MaxComputeClientImpl &m_sdk_impl;
@@ -669,8 +707,12 @@ class ResultStreamImpl : public ResultStream {
 
   std::unique_ptr<DownloadSession> m_downloadSession;
   std::unique_ptr<ConcurrentBufferedRecordReader> m_bufferedReader;
+  std::optional<Record> m_fallback_row;
 
+  bool m_session_initialized = false;
   bool m_stream_initialized = false;
+  bool m_non_tabular = false;
+  bool m_fallback_row_consumed = false;
   bool m_end_of_stream = false;
   std::mutex m_mutex;
 };
@@ -785,38 +827,7 @@ Result<std::unique_ptr<ResultStream>> MaxComputeClient::executeQuery(
     MCO_LOG_INFO("Added quota hint: {}", config_.quotaName.value());
   }
 
-  // 3. 先通过 EXPLAIN CODE 获取 schema（同步阻塞）
-  auto schema_json_result = impl_->getSchemaJson(original_request);
-  if (!schema_json_result.has_value()) {
-    return makeError<std::unique_ptr<ResultStream>>(
-        schema_json_result.error().code,
-        "Failed to retrieve schema: " + schema_json_result.error().message);
-  }
-  std::string schema_json = schema_json_result.value();
-  std::shared_ptr<const ResultSetSchema> schema;
-  bool non_tabular_result = false;
-  if (schema_json.empty() ||
-      schema_json.find("nothing to explain") != std::string::npos) {
-    non_tabular_result = true;
-  } else {
-    auto schema_parse_result = ResultSetSchema::FromJson(schema_json);
-    if (!schema_parse_result.has_value()) {
-      return makeError<std::unique_ptr<ResultStream>>(
-          ErrorCode::ParseError, "Failed to parse schema JSON: " +
-                                     schema_parse_result.error().message);
-    }
-    schema = std::make_shared<const ResultSetSchema>(
-        std::move(schema_parse_result.value()));
-  }
-
-  auto endTime = std::chrono::steady_clock::now();
-  auto duration =
-      std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime)
-          .count();
-  MCO_LOG_INFO("Get result schema succeeded in {} ms", duration);
-  startTime = std::chrono::steady_clock::now();
-
-  // 4. 提交真实查询（异步，立即返回 QueryID）
+  // 3. 提交真实查询（异步，立即返回 QueryID）
   auto instance_result = impl_->submitQuery(original_request);
   if (!instance_result.has_value()) {
     return makeError<std::unique_ptr<ResultStream>>(
@@ -825,38 +836,12 @@ Result<std::unique_ptr<ResultStream>> MaxComputeClient::executeQuery(
   }
   Instance instance = instance_result.value();
 
-  // 非结构化结果通过 ODPS Worker 返回 StaticResultStream
-  if (non_tabular_result) {
-    // b. 等待查询完成
-    auto wait_result = impl_->waitForSuccess(instance);
-    if (!wait_result.has_value()) {
-      return makeError<std::unique_ptr<ResultStream>>(
-          wait_result.error().code, wait_result.error().message);
-    }
-    // c. 获取非结构化的原始结果（传递 MaxQA 信息）
-    const MaxQASessionInfo *maxQAInfo =
-        instance.maxQAInfo.isMaxQA ? &instance.maxQAInfo : nullptr;
-    auto raw_result = impl_->getRawResult(instance.id, maxQAInfo);
-    if (!raw_result.has_value()) {
-      return makeError<std::unique_ptr<ResultStream>>(
-          raw_result.error().code,
-          "Failed to get raw result: " + raw_result.error().message);
-    }
-    // e. 创建一个包含单行单列数据的 Record
-    auto stream = StaticResultSetBuilder()
-                      .addColumn("Result", PrimitiveTypeInfo(OdpsType::STRING))
-                      .addRowValues(raw_result.value())
-                      .build();
-    return makeSuccess(std::move(stream));
-  }
   auto logview = generateLogview(instance.id);
-  // 5. 结构化结果通过 InstanceTunnel 创建 ResultStreamImpl 实现
-  auto stream =
-      std::make_unique<ResultStreamImpl>(*impl_, std::move(instance), schema);
-  endTime = std::chrono::steady_clock::now();
-  duration =
+  auto endTime = std::chrono::steady_clock::now();
+  auto duration =
       std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime)
           .count();
+  auto stream = std::make_unique<ResultStreamImpl>(*impl_, std::move(instance));
   MCO_LOG_INFO("Submit query succeeded in {} ms, logview: {}", duration,
                logview);
   return makeSuccess(std::move(stream));

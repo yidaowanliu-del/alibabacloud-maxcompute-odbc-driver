@@ -164,8 +164,9 @@ class ResultStream {
  public:
   virtual const std::string &getId() const = 0;
   // [ODBC Mapping: SQLDescribeCol, SQLNumResultCols]
-  // 获取已解析和缓存的ODBC原生Schema。
-  // 这个方法将在SQLExecDirect的实现中被调用，必须是纯内存操作。
+  // 获取ODBC原生Schema。
+  // 该方法允许懒初始化底层结果源，因此可能阻塞直到查询完成并拿到
+  // tunnel schema，或降级为 raw result fallback schema。
   virtual Result<const ResultSetSchema *> getSchema() = 0;
 
   // [ODBC Mapping: SQLFetch]

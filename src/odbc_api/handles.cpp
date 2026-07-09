@@ -204,6 +204,7 @@ SQLRETURN StmtHandle::describeCol(SQLUSMALLINT col_num, SQLCHAR *col_name_buf,
   auto result = m_result_stream->getSchema();
   if (!result.has_value()) {
     addDiagRecord({0, "00000", result.error().message});
+    return SQL_ERROR;
   }
   auto &schema = result.value();
   if (col_num == 0 || col_num > schema->getColumnCount()) {
@@ -256,6 +257,7 @@ SQLRETURN StmtHandle::bindCol(SQLUSMALLINT col_num, SQLSMALLINT target_type,
     auto result = m_result_stream->getSchema();
     if (!result.has_value()) {
       addDiagRecord({0, "00000", result.error().message});
+      return SQL_ERROR;
     }
     auto &schema = result.value();
     m_bindings.resize(schema->getColumnCount());
@@ -366,6 +368,7 @@ SQLRETURN StmtHandle::getColAttribute(SQLUSMALLINT column_number,
   auto result = m_result_stream->getSchema();
   if (!result.has_value()) {
     addDiagRecord({0, "00000", result.error().message});
+    return SQL_ERROR;
   }
   auto &schema = result.value();
   if (column_number == 0 || column_number > schema->getColumnCount()) {
@@ -624,6 +627,7 @@ SQLRETURN StmtHandle::getData(SQLUSMALLINT col_num, SQLSMALLINT target_type,
   auto result = m_result_stream->getSchema();
   if (!result.has_value()) {
     addDiagRecord({0, "00000", result.error().message});
+    return SQL_ERROR;
   }
   auto &schema = result.value();
   if (col_num == 0 || col_num > schema->getColumnCount()) {
