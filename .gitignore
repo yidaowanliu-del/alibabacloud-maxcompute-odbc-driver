@@ -127,3 +127,14 @@ IFLOW.md
 IMPLEMENTATION_SUMMARY.md
 FORMATTING.md
 MaxCompute_ODBC_Driver_Readme.txt
+
+# Local analysis and testing
+aosom/
+.neuralmemory/
+.pyre/
+.pydevd/
+.python-version
+pyproject.toml
+uv.lock
+test_macos_driver.py
+test_macos_driver_backup.py
