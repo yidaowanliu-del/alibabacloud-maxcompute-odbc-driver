@@ -6,6 +6,70 @@
 
 namespace maxcompute_odbc {
 
+namespace {
+
+// 返回 ColumnData 当前持有的源类型名，用于转换失败时定位具体字段。
+const char *columnDataTypeName(const ColumnData &d) {
+  switch (d.index()) {
+    case 0:  return "NULL";
+    case 1:  return "int";
+    case 2:  return "short";
+    case 3:  return "bool";
+    case 4:  return "int64";
+    case 5:  return "double";
+    case 6:  return "string";
+    case 7:  return "McDate";
+    case 8:  return "McTimestamp";
+    case 9:  return "McArray";
+    case 10: return "McMap";
+    case 11: return "McStruct";
+    default: return "unknown";
+  }
+}
+
+// 返回 SQL_C_* 目标类型名，覆盖常见值；未命中则回退为 "type=N"。
+std::string cTargetTypeName(SQLSMALLINT t) {
+  switch (t) {
+    case SQL_C_CHAR:              return "SQL_C_CHAR";
+    case SQL_C_BINARY:            return "SQL_C_BINARY";
+    case SQL_C_LONG:
+    case SQL_C_SLONG:             return "SQL_C_LONG";
+    case SQL_C_SHORT:             return "SQL_C_SHORT";
+    case SQL_C_FLOAT:             return "SQL_C_FLOAT";
+    case SQL_C_DOUBLE:            return "SQL_C_DOUBLE";
+    case SQL_C_BIT:               return "SQL_C_BIT";
+    case SQL_C_TINYINT:
+    case SQL_C_STINYINT:          return "SQL_C_TINYINT";
+    case SQL_C_UTINYINT:          return "SQL_C_UTINYINT";
+    case SQL_C_SBIGINT:           return "SQL_C_SBIGINT";
+    case SQL_C_UBIGINT:           return "SQL_C_UBIGINT";
+    case SQL_C_DATE:
+    case SQL_C_TYPE_DATE:         return "SQL_C_DATE";
+    case SQL_C_TIME:
+    case SQL_C_TYPE_TIME:         return "SQL_C_TIME";
+    case SQL_C_TIMESTAMP:
+    case SQL_C_TYPE_TIMESTAMP:    return "SQL_C_TIMESTAMP";
+    case SQL_C_NUMERIC:           return "SQL_C_NUMERIC";
+    case SQL_C_DEFAULT:           return "SQL_C_DEFAULT";
+    default:                      return "type=" + std::to_string(t);
+  }
+}
+
+// 构造字段级的转换失败诊断信息: "Convert failed for column <N> (<name>): source <src> -> target <dst>".
+// col_num 为 1-based ODBC 列号; col_name 为空时仅显示列号.
+std::string buildConvertFailureMsg(SQLUSMALLINT col_num,
+                                   const std::string &col_name,
+                                   const ColumnData &data,
+                                   SQLSMALLINT target_type) {
+  std::string msg = "Convert failed for column " + std::to_string(col_num);
+  if (!col_name.empty()) msg += " (" + col_name + ")";
+  msg += ": source " + columnDataTypeName(data) + " -> target " +
+         cTargetTypeName(target_type);
+  return msg;
+}
+
+}  // namespace
+
 SQLRETURN ConnHandle::connect(const std::string &dsn, const std::string &user,
                               const std::string &pass) {
   MCO_LOG_DEBUG("Attempting connection with input string: '{}' and user: '{}'",
@@ -326,6 +390,17 @@ SQLRETURN StmtHandle::fetch() {
     const auto &column_data = m_current_row->values[i];
     SQLRETURN conv_ret = convertAndWrite(column_data, binding, client_charset);
     if (conv_ret == SQL_ERROR) {
+      // 定位到具体列: 列号(1-based) + 列名 + 源类型 + 目标类型, 写入诊断与日志.
+      std::string col_name;
+      if (auto schema_res = m_result_stream->getSchema();
+          schema_res.has_value() && i < (*schema_res)->getColumnCount()) {
+        col_name = (*schema_res)->getColumn(i).name;
+      }
+      auto msg = buildConvertFailureMsg(static_cast<SQLUSMALLINT>(i + 1),
+                                        col_name, column_data,
+                                        binding.target_type);
+      MCO_LOG_ERROR("{}", msg);
+      addDiagRecord({0, "07006", std::move(msg)});
       return SQL_ERROR;
     }
     if (conv_ret == SQL_SUCCESS_WITH_INFO) {
@@ -654,6 +729,11 @@ SQLRETURN StmtHandle::getData(SQLUSMALLINT col_num, SQLSMALLINT target_type,
                     : std::string("UTF-8");
   SQLRETURN conv_ret = convertAndWrite(column_data, binding, client_charset);
   if (conv_ret == SQL_ERROR) {
+    const auto &col_schema = schema->getColumn(col_num - 1);
+    auto msg =
+        buildConvertFailureMsg(col_num, col_schema.name, column_data, target_type);
+    MCO_LOG_ERROR("{}", msg);
+    addDiagRecord({0, "07006", std::move(msg)});
     return SQL_ERROR;
   }
   if (conv_ret == SQL_SUCCESS_WITH_INFO) {

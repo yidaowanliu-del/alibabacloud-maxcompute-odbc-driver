@@ -1377,10 +1377,24 @@ SQLRETURN SQL_API SQLExecute(SQLHSTMT StatementHandle) {
 // SQLFetch is an old ODBC 2.x function for fetching the next row of a result
 // set
 SQLRETURN SQL_API SQLFetch(SQLHSTMT StatementHandle) {
+  MCO_LOG_DEBUG("SQLFetch called with statement handle: {}",
+                reinterpret_cast<void *>(StatementHandle));
   auto *stmt = maxcompute_odbc::HandleRegistry::instance()
                    .get<maxcompute_odbc::StmtHandle>(StatementHandle);
-  if (!stmt) return SQL_INVALID_HANDLE;
-  return stmt->fetch();
+  if (!stmt) {
+    MCO_LOG_DEBUG(
+        "SQLFetch: invalid statement handle, returning SQL_INVALID_HANDLE");
+    return SQL_INVALID_HANDLE;
+  }
+  SQLRETURN ret = stmt->fetch();
+  const char *ret_name =
+      ret == SQL_SUCCESS              ? "SQL_SUCCESS"
+      : ret == SQL_SUCCESS_WITH_INFO  ? "SQL_SUCCESS_WITH_INFO"
+      : ret == SQL_NO_DATA            ? "SQL_NO_DATA"
+      : ret == SQL_ERROR              ? "SQL_ERROR"
+                                      : "SQL_INVALID_HANDLE/OTHER";
+  MCO_LOG_DEBUG("SQLFetch returning: {}", ret_name);
+  return ret;
 }
 
 // --- 绑定列 ---
