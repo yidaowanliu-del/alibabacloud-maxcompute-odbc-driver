@@ -289,6 +289,10 @@ Config ConnectionStringParser::parse(const std::string &connStr) {
       } catch (...) {
         config.fetchResultThreadNum = 5;
       }
+    } else if (lowerKey == "tunnelendpoint") {
+      if (!value.empty()) {
+        config.tunnelEndpoint = value;
+      }
     } else if (lowerKey == "logviewhost") {
       config.logviewHost = value;
     } else if (lowerKey == "globalsettings") {
